@@ -1,0 +1,21 @@
+@import "tailwindcss";
+
+@theme {
+  --font-pixel: "Press Start 2P", ui-monospace, "Courier New", monospace;
+  --color-ink: #1b1b2f;
+  --color-night: #2b2d5b;
+  --color-sun: #ffd23f;
+  --color-ember: #ff6b35;
+  --color-mint: #7ed957;
+  --color-cream: #fff6d6;
+  --animate-pop: pop 0.2s steps(4);
+  @keyframes pop {
+    0% { transform: scale(1.5); }
+    100% { transform: scale(1); }
+  }
+}
+
+/* Genuinely global rules only: reset, pixel rendering, no overscroll bounce. */
+html, body, #root { height: 100%; margin: 0; }
+body { overscroll-behavior: none; background: #1b1b2f; -webkit-tap-highlight-color: transparent; }
+canvas { image-rendering: crisp-edges; image-rendering: pixelated; }
