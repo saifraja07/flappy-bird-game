@@ -1,48 +1,125 @@
 import { AUDIO_MANIFEST } from '../assets/assetManifest.js';
 
-const MIN_GAP = { flap: 0.06, score: 0.08, hit: 0.2, best: 0.5, click: 0.04 };
+const MIN_GAP = { flap: 0.06, score: 0.08, click: 0.04 };
 const MAX_VOICES = 10;
+const PRELOAD_TIMEOUT_MS = 8000;
+const UNLOCK_EVENTS = ['pointerdown', 'pointerup', 'touchend', 'click', 'keydown'];
 
-/** Procedural Web Audio sound effects. Every call is a safe no-op if audio is unavailable. */
+/**
+ * Audio for the game.
+ *  - Short effects (flap, score, click) are synthesized with Web Audio.
+ *  - File clips (start.mp3, gameover.mp3) are fetched + decoded into AudioBuffers up front, so they start
+ *    instantly and are never streamed lazily on first play (that was the "audio plays only after a while" bug).
+ * Every public method is a safe no-op if audio is unavailable; audio must never break gameplay.
+ */
 export class AudioManager {
   constructor({
     AudioCtx = globalThis.AudioContext ?? globalThis.webkitAudioContext,
     muted = false,
-    createAudio = (src) => new Audio(src),
     clips = AUDIO_MANIFEST,
     baseUrl = import.meta.env?.BASE_URL ?? './',
+    fetchFn = globalThis.fetch?.bind(globalThis),
   } = {}) {
-    this.createAudio = createAudio;
+    this.AudioCtx = AudioCtx;
     this.clipPaths = clips;
     this.baseUrl = baseUrl;
-    this.clips = {};
-    this.AudioCtx = AudioCtx;
+    this.fetchFn = fetchFn;
     this.muted = muted;
     this.ctx = null;
-    this.master = null;
+    this.master = null; // SFX bus (lowpass'd)
+    this.clipGain = null; // file-clip bus
     this.voices = 0;
     this.lastPlayed = {};
+    this.buffers = {}; // name -> decoded AudioBuffer
+    this.playing = {}; // name -> { src, startedAt }
+    this.paused = {}; // name -> resume offset (seconds)
+    this.wanted = new Set(); // clips requested before they finished decoding
+    this.preloadPromise = null;
     this.disposed = false;
   }
 
-  /** Create/resume the context. Call from a user gesture (pointer/key). */
-  unlock() {
-    if (this.disposed || !this.AudioCtx) return;
+  /** Creates the AudioContext (suspended until a user gesture) and its buses. Returns the context or null. */
+  ensureContext() {
+    if (this.disposed || !this.AudioCtx) return null;
+    if (this.ctx) return this.ctx;
     try {
-      if (!this.ctx) {
-        this.ctx = new this.AudioCtx();
-        const filter = this.ctx.createBiquadFilter();
-        filter.type = 'lowpass';
-        filter.frequency.value = 3200;
-        this.master = this.ctx.createGain();
-        this.master.gain.value = 0.5;
-        this.master.connect(filter);
-        filter.connect(this.ctx.destination);
-      }
-      if (this.ctx.state === 'suspended') this.ctx.resume?.().catch?.(() => {});
+      const ctx = new this.AudioCtx();
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.value = 3200;
+      const master = ctx.createGain();
+      master.gain.value = 0.5;
+      master.connect(filter);
+      filter.connect(ctx.destination);
+      const clipGain = ctx.createGain();
+      clipGain.gain.value = 1;
+      clipGain.connect(ctx.destination);
+      this.ctx = ctx;
+      this.master = master;
+      this.clipGain = clipGain;
     } catch {
-      this.ctx = null;
+      this.ctx = this.master = this.clipGain = null;
     }
+    return this.ctx;
+  }
+
+  /** Resume the context. Safe to call repeatedly; browsers only allow it from a user gesture. */
+  unlock() {
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+    try {
+      if (ctx.state !== 'running') ctx.resume?.()?.catch?.(() => {});
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** Unlocks audio on the first real gesture of any kind (iOS needs touchend/click, not just pointerdown). */
+  bindUnlock(target = globalThis.window) {
+    if (!target?.addEventListener) return () => {};
+    const onGesture = () => this.unlock();
+    UNLOCK_EVENTS.forEach((e) => target.addEventListener(e, onGesture, { passive: true, capture: true }));
+    return () => UNLOCK_EVENTS.forEach((e) => target.removeEventListener(e, onGesture, { capture: true }));
+  }
+
+  /**
+   * Fetches and decodes every file clip. Never rejects. Resolves when all clips are ready, have failed,
+   * or `timeoutMs` has passed (a clip that finishes later still plays, if it is still wanted by then).
+   */
+  preload(timeoutMs = PRELOAD_TIMEOUT_MS) {
+    if (this.preloadPromise) return this.preloadPromise;
+    let timer;
+    const all = Promise.all(Object.keys(this.clipPaths).map((name) => this.loadClip(name)));
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(resolve, timeoutMs);
+    });
+    this.preloadPromise = Promise.race([all, timeout]).then(() => clearTimeout(timer));
+    return this.preloadPromise;
+  }
+
+  async loadClip(name) {
+    if (this.buffers[name] || this.disposed) return;
+    try {
+      if (!this.fetchFn || !this.ensureContext()) return;
+      const res = await this.fetchFn(this.baseUrl + this.clipPaths[name]);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.arrayBuffer();
+      if (this.disposed || !this.ctx) return;
+      const buffer = await this.decode(data);
+      if (this.disposed) return;
+      this.buffers[name] = buffer;
+      if (this.wanted.delete(name) && !this.muted) this.startClip(name, 0);
+    } catch {
+      /* missing or undecodable file: that clip is simply silent */
+    }
+  }
+
+  decode(data) {
+    return new Promise((resolve, reject) => {
+      // Older Safari only supports the callback form; modern browsers return a promise. Settling twice is harmless.
+      const p = this.ctx.decodeAudioData(data, resolve, reject);
+      p?.then?.(resolve, reject);
+    });
   }
 
   setMuted(muted) {
@@ -50,62 +127,77 @@ export class AudioManager {
     if (this.muted) this.stopClips();
   }
 
-  getClip(name) {
-    if (!this.clips[name] && this.clipPaths[name]) {
-      try {
-        const a = this.createAudio(this.baseUrl + this.clipPaths[name]);
-        a.preload = 'auto';
-        this.clips[name] = a;
-      } catch {
-        this.clips[name] = null;
-      }
-    }
-    return this.clips[name] ?? null;
-  }
-
-  /** Plays a file clip from the start. Never throws; missing files are ignored. */
-  playClip(name) {
-    if (this.muted || this.disposed) return;
-    const a = this.getClip(name);
-    if (!a) return;
+  // ---- file clips ---------------------------------------------------------
+  startClip(name, offset = 0) {
+    const buffer = this.buffers[name];
+    if (!buffer || !this.ctx || !this.clipGain) return;
+    this.stopNode(name); // a clip can never overlap itself
     try {
-      a.currentTime = 0;
-      a.play()?.catch?.(() => {});
+      const src = this.ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(this.clipGain);
+      src.onended = () => {
+        if (this.playing[name]?.src === src) delete this.playing[name];
+      };
+      src.start(0, offset);
+      this.playing[name] = { src, startedAt: this.ctx.currentTime - offset };
     } catch {
       /* ignore */
     }
+  }
+
+  stopNode(name) {
+    const p = this.playing[name];
+    if (!p) return;
+    delete this.playing[name];
+    p.src.onended = null;
+    try {
+      p.src.stop();
+    } catch {
+      /* already stopped */
+    }
+    try {
+      p.src.disconnect();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** Plays a file clip from the start. If it is still loading it starts as soon as it is ready. */
+  playClip(name) {
+    if (this.muted || this.disposed || !this.clipPaths[name]) return;
+    delete this.paused[name];
+    if (this.buffers[name]) this.startClip(name, 0);
+    else this.wanted.add(name);
   }
 
   stopClip(name) {
-    const a = this.clips[name];
-    try {
-      a?.pause();
-      if (a) a.currentTime = 0;
-    } catch {
-      /* ignore */
-    }
+    this.wanted.delete(name);
+    delete this.paused[name];
+    this.stopNode(name);
   }
 
   stopClips() {
-    Object.keys(this.clips).forEach((n) => this.stopClip(n));
+    Object.keys(this.clipPaths).forEach((n) => this.stopClip(n));
   }
 
   pauseClips() {
-    Object.values(this.clips).forEach((a) => {
-      try {
-        a?.pause();
-      } catch {
-        /* ignore */
-      }
-    });
+    this.wanted.clear();
+    for (const name of Object.keys(this.playing)) {
+      const offset = this.ctx.currentTime - this.playing[name].startedAt;
+      if (offset < (this.buffers[name]?.duration ?? 0)) this.paused[name] = offset;
+      this.stopNode(name);
+    }
   }
 
   resumeClips() {
     if (this.muted) return;
-    const a = this.clips.start;
-    if (a && a.currentTime > 0 && !a.ended) a.play?.()?.catch?.(() => {});
+    const paused = this.paused;
+    this.paused = {};
+    Object.entries(paused).forEach(([name, offset]) => this.startClip(name, offset));
   }
 
+  // ---- synthesized effects -----------------------------------------------
   play(name) {
     if (this.muted || this.disposed || !this.ctx || !this.master || this.voices >= MAX_VOICES) return;
     const now = this.ctx.currentTime;
@@ -118,11 +210,6 @@ export class AudioManager {
           this.tone('square', 784, 0, 0.07, 0.14, now);
           this.tone('square', 1175, 0, 0.14, 0.14, now + 0.07);
           break;
-        case 'hit':
-          this.noise(0.18, 0.35, now);
-          this.tone('sawtooth', 190, 50, 0.3, 0.3, now);
-          break;
-        case 'best': [523, 659, 784, 1047].forEach((f, i) => this.tone('triangle', f, 0, 0.16, 0.25, now + 0.25 + i * 0.09)); break;
         case 'click': this.tone('triangle', 520, 780, 0.06, 0.25, now); break;
         default: break;
       }
@@ -151,35 +238,17 @@ export class AudioManager {
     o.stop(t + dur + 0.02);
   }
 
-  noise(dur, vol, t) {
-    const len = Math.max(1, Math.floor(this.ctx.sampleRate * dur));
-    const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
-    const data = buf.getChannelData(0);
-    for (let i = 0; i < len; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / len);
-    const src = this.ctx.createBufferSource();
-    const g = this.ctx.createGain();
-    src.buffer = buf;
-    g.gain.value = vol;
-    src.connect(g);
-    g.connect(this.master);
-    this.voices += 1;
-    src.onended = () => {
-      this.voices -= 1;
-      g.disconnect();
-    };
-    src.start(t);
-  }
-
   dispose() {
     this.disposed = true;
     this.stopClips();
-    this.clips = {};
+    this.buffers = {};
     try {
-      this.ctx?.close?.().catch?.(() => {});
+      this.ctx?.close?.()?.catch?.(() => {});
     } catch {
       /* ignore */
     }
     this.ctx = null;
     this.master = null;
+    this.clipGain = null;
   }
 }

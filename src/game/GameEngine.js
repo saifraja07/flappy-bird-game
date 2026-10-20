@@ -176,9 +176,7 @@ export class GameEngine {
     this.deadTime = 0;
     this.shakeTime = this.cfg.shake.duration;
     this.audio?.stopClip?.('start');
-    this.audio?.play('hit');
     this.audio?.playClip?.('gameover');
-    if (result.isNewBest) this.audio?.play('best');
     const hb = birdHitbox(this.bird, this.cfg);
     this.burst(hb.x + hb.w / 2, hb.y + hb.h / 2, 14, '#ffd23f', 140);
     this.cb.onGameOver?.(result);

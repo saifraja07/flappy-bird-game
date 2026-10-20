@@ -143,6 +143,7 @@ describe('failure handling', () => {
     expect(() => {
       a.unlock();
       a.play('flap');
+      a.playClip('start');
       a.setMuted(true);
       a.dispose();
     }).not.toThrow();
@@ -154,33 +155,101 @@ describe('failure handling', () => {
     const b = new AudioManager({ AudioCtx: Throwing });
     expect(() => {
       b.unlock();
-      b.play('hit');
+      b.play('flap');
+      b.playClip('gameover');
     }).not.toThrow();
   });
 });
 
+// Minimal Web Audio fake that records every buffer source that is started/stopped.
+const fakeWebAudio = () => {
+  const log = [];
+  const node = () => ({ connect() {}, disconnect() {}, gain: { value: 1, setValueAtTime() {}, exponentialRampToValueAtTime() {} }, frequency: { value: 0, setValueAtTime() {}, exponentialRampToValueAtTime() {} } });
+  class Ctx {
+    constructor() {
+      this.state = 'suspended';
+      this.currentTime = 0;
+      this.destination = {};
+      this.sampleRate = 44100;
+    }
+    createBiquadFilter() { return { ...node(), frequency: { value: 0 } }; }
+    createGain() { return node(); }
+    createOscillator() { return { ...node(), start() {}, stop() {} }; }
+    createBufferSource() {
+      const s = { ...node(), buffer: null, onended: null, start: (_w, off = 0) => log.push(['start', s.buffer.name, off]), stop: () => log.push(['stop', s.buffer.name]) };
+      return s;
+    }
+    resume() { this.state = 'running'; return Promise.resolve(); }
+    decodeAudioData(data) { return Promise.resolve({ name: data.name, duration: 55 }); }
+    close() { return Promise.resolve(); }
+  }
+  const fetchFn = async (url) => ({ ok: !url.includes('missing'), arrayBuffer: async () => ({ name: url.split('/').pop() }) });
+  return { log, Ctx, fetchFn };
+};
+
 describe('audio clips', () => {
-  const fakeAudio = () => {
-    const log = [];
-    return { log, create: (src) => ({ src, currentTime: 0, play: () => (log.push(['play', src]), Promise.resolve()), pause: () => log.push(['pause', src]) }) };
+  const setup = async (extra = {}) => {
+    const f = fakeWebAudio();
+    const audio = new AudioManager({ AudioCtx: f.Ctx, fetchFn: f.fetchFn, baseUrl: '/', ...extra });
+    await audio.preload();
+    return { f, audio };
   };
-  it('plays start clip on run start and game-over clip on every death', () => {
-    const f = fakeAudio();
-    const audio = new AudioManager({ AudioCtx: undefined, createAudio: f.create, baseUrl: '/' });
+  const names = (log, kind) => log.filter((l) => l[0] === kind).map((l) => l[1]);
+
+  it('plays start on run start and ONLY gameover on death, every run', async () => {
+    const { f, audio } = await setup();
     for (let run = 0; run < 2; run++) {
       const e = make({ audio });
       e.input();
       for (let i = 0; i < 300 && e.state !== STATES.GAME_OVER; i++) e.update(1 / 60);
+      expect(e.state).toBe(STATES.GAME_OVER);
     }
-    const plays = f.log.filter((l) => l[0] === 'play').map((l) => l[1]);
-    expect(plays).toEqual(['/assets/audio/start.mp3', '/assets/audio/gameover.mp3', '/assets/audio/start.mp3', '/assets/audio/gameover.mp3']);
+    expect(names(f.log, 'start')).toEqual(['start.mp3', 'gameover.mp3', 'start.mp3', 'gameover.mp3']);
+    // music is cut when each run ends; the 2nd death also cuts the 1st run's still-playing gameover (no overlap)
+    expect(names(f.log, 'stop')).toEqual(['start.mp3', 'start.mp3', 'gameover.mp3']);
   });
-  it('respects mute and tolerates a failing Audio constructor', () => {
-    const f = fakeAudio();
-    const a = new AudioManager({ AudioCtx: undefined, createAudio: f.create, muted: true });
-    a.playClip('start');
+
+  it('starts a clip requested before it finished loading, once it is ready', async () => {
+    const f = fakeWebAudio();
+    const audio = new AudioManager({ AudioCtx: f.Ctx, fetchFn: f.fetchFn, baseUrl: '/' });
+    audio.playClip('start'); // not decoded yet
     expect(f.log).toHaveLength(0);
-    const b = new AudioManager({ AudioCtx: undefined, createAudio: () => { throw new Error('x'); } });
+    await audio.preload();
+    expect(names(f.log, 'start')).toEqual(['start.mp3']);
+  });
+
+  it('never overlaps a clip with itself, and pause/resume continues from the same spot', async () => {
+    const { f, audio } = await setup();
+    audio.playClip('start');
+    audio.playClip('start');
+    expect(names(f.log, 'start')).toEqual(['start.mp3', 'start.mp3']);
+    expect(names(f.log, 'stop')).toEqual(['start.mp3']);
+    audio.ctx.currentTime = 5;
+    audio.pauseClips();
+    audio.resumeClips();
+    const last = f.log.filter((l) => l[0] === 'start').pop();
+    expect(last[2]).toBe(5);
+  });
+
+  it('respects mute and tolerates missing files', async () => {
+    const { f, audio } = await setup({ muted: true });
+    audio.playClip('start');
+    expect(f.log).toHaveLength(0);
+    const g = fakeWebAudio();
+    const b = new AudioManager({ AudioCtx: g.Ctx, fetchFn: g.fetchFn, clips: { start: 'missing/start.mp3' } });
+    await expect(b.preload()).resolves.toBeUndefined();
     expect(() => b.playClip('start')).not.toThrow();
+  });
+
+  it('plays no extra sounds at game over (no hit / best effects)', async () => {
+    const { audio } = await setup();
+    const played = [];
+    const orig = audio.play.bind(audio);
+    audio.play = (n) => (played.push(n), orig(n));
+    const e = make({ audio });
+    e.input();
+    for (let i = 0; i < 300 && e.state !== STATES.GAME_OVER; i++) e.update(1 / 60);
+    expect(played).not.toContain('hit');
+    expect(played).not.toContain('best');
   });
 });

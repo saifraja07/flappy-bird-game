@@ -23,7 +23,9 @@ export function useGameController(canvasRef) {
     let engine = null;
     const audio = new AudioManager({ muted: settingsRef.current.muted });
     audioRef.current = audio;
-    loadAssets().then(({ assets }) => {
+    const unbindUnlock = audio.bindUnlock();
+    // Hold the loading screen until sprites AND sounds are ready, so the first run always has audio.
+    Promise.all([loadAssets(), audio.preload()]).then(([{ assets }]) => {
       if (cancelled || !canvasRef.current) return;
       engine = new GameEngine({
         canvas: canvasRef.current,
@@ -43,6 +45,7 @@ export function useGameController(canvasRef) {
     });
     return () => {
       cancelled = true;
+      unbindUnlock();
       engine?.destroy();
       audio.dispose();
       engineRef.current = null;
